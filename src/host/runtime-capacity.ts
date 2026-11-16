@@ -201,15 +201,18 @@ function runtimeError(error: unknown, signal: AbortSignal): Error {
   if (!cancelled && sourceFailure(error, 'runtime-capacity')) {
     // JSON serialization drops Error.message but retains the Source's numeric
     // capacity fields. Do not dump arbitrary objects to reconstruct the message.
-    fallback = [value?.used, value?.projected, value?.limit].every(field => Number.isSafeInteger(field) && Number(field) >= 0)
-      ? `Runtime memory capacity exceeded: ${value!.projected} bytes (current ${value!.used}, limit ${value!.limit}). Archive and compact runtime memory before retrying.`
-      : 'Runtime memory capacity exceeded. Archive and compact runtime memory before retrying.'
+    const fields = [value?.used, value?.projected, value?.limit]
+    fallback = fields.every(field => Number.isSafeInteger(field) && Number(field) >= 0)
+      ? `Runtime memory capacity exceeded: ${value!.projected} bytes (current ${value!.used}, limit ${value!.limit}). Free at least ${Number(value!.projected) - Number(value!.limit)} bytes, then retry: shorten or remove one of the entries below, or raise the limit.`
+      : 'Runtime memory capacity exceeded. Shorten or remove an existing entry, then retry.'
   }
   const message = errorMessage(error, fallback)
-  if (error instanceof Error && error.message === message) return error
-  const result = new Error(message, { cause: error })
+  const result = error instanceof Error && error.message === message ? error : new Error(message, { cause: error })
   if (typeof value?.code === 'string') Object.assign(result, { code: value.code })
   if (typeof value?.name === 'string') result.name = value.name
+  // The Source hands back the committed entries and the exact byte deficit so the model can
+  // retry in one shot instead of guessing how much to cut.
+  if (value?.details !== undefined) Object.assign(result, { details: value.details })
   if (cancelled) result.name = 'AbortError'
   return result
 }

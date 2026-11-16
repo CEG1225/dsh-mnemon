@@ -20,4 +20,6 @@ export function apply(ctx: Context, config: Config = {}): void {
 }
 
 export { createRuntimeMemorySource, RUNTIME_MEMORY_SOURCE } from './source.ts'
+export { scanForThreats, assertNoThreats, firstThreatMessage, THREAT_PATTERN_IDS, type ThreatScope } from './threat-scan.ts'
+export type { RuntimeCapacityEntry, RuntimeCapacityField } from './controller.ts'
 export type * from './contracts.ts'
