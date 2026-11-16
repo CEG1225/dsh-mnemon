@@ -4,7 +4,7 @@
  * tests/subagent.spec.ts pins this text as the children read it.
  */
 import type { Insight, MemorySpaceMetadataSample } from 'dsh-mnemon-source-memory-spaces/contracts'
-import { RUNTIME_ENTRY_DELIMITER, RUNTIME_PROJECTION_FILES, type RuntimeMemoryMaintenancePlan } from 'dsh-mnemon-source-runtime/contracts'
+import { RUNTIME_ENTRY_DELIMITER, RUNTIME_PROJECTION_FILES, guardedEntryBody, type RuntimeMemoryMaintenancePlan } from 'dsh-mnemon-source-runtime/contracts'
 
 export const WRITE_ACTIONS = ['stored', 'updated', 'added', 'replaced', 'removed', 'skipped', 'forgotten', 'linked', 'created', 'merged', 'accepted', 'candidate', 'partial', 'unknown', 'failed'] as const
 
@@ -181,7 +181,7 @@ export function runtimeSnapshotContext(
   const file = RUNTIME_PROJECTION_FILES[target]
   const rendered = entries.length === 0
     ? '(empty)'
-    : entries.map((entry, index) => `${index + 1}. [importance=${entry.importance}${runtimeEntryScopeMeta(entry)}] ${entry.content}`).join(RUNTIME_ENTRY_DELIMITER)
+    : entries.map((entry, index) => `${index + 1}. [importance=${entry.importance}${runtimeEntryScopeMeta(entry)}] ${guardedEntryBody(entry.content)}`).join(RUNTIME_ENTRY_DELIMITER)
   return `Committed ${file} snapshot (read-only run data; numbering is one-based):
 <runtime-memory-snapshot target="${target}">
 ${rendered}

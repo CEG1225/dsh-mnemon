@@ -6,7 +6,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import type { HostSubagentResult } from "./dsh.ts"
-import { RUNTIME_ENTRY_DELIMITER, type RuntimeMemoryCompactedEntry, type RuntimeMemoryMaintenancePlan, type RuntimeMemoryMutation, type RuntimeMemoryMutationResult } from 'dsh-mnemon-source-runtime/contracts'
+import { RUNTIME_ENTRY_DELIMITER, guardedEntryBody, type RuntimeMemoryCompactedEntry, type RuntimeMemoryMaintenancePlan, type RuntimeMemoryMutation, type RuntimeMemoryMutationResult } from 'dsh-mnemon-source-runtime/contracts'
 import type { Insight, MemorySpaceCatalog, MemorySpaceWriteScopeRequest } from 'dsh-mnemon-source-memory-spaces/contracts'
 import { mutationResultCommitted } from './receipts.ts'
 import { sourceFailure, type SourceSession } from './source-session.ts'
@@ -66,7 +66,9 @@ function runtimeRouteChunks(entries: ReadonlyArray<{ content: string; importance
   let used = 0
   for (const [offset, entry] of entries.entries()) {
     const index = offset + 1
-    const line = `${index}. [importance=${entry.importance}${runtimeEntryScopeMeta(entry)}] ${runtimeRoutingExcerpt(entry.content)}`
+    // Guard before truncating: the scan needs the whole entry, and a cut in the middle of a payload
+    // would let the shape slip past the excerpt.
+    const line = `${index}. [importance=${entry.importance}${runtimeEntryScopeMeta(entry)}] ${runtimeRoutingExcerpt(guardedEntryBody(entry.content))}`
     const separatorLength = rendered.length === 0 ? 0 : RUNTIME_ENTRY_DELIMITER.length
     if (rendered.length > 0 && used + separatorLength + line.length > RUNTIME_ROUTE_CHUNK_CHARACTERS) {
       chunks.push({ indexes, context: rendered.join(RUNTIME_ENTRY_DELIMITER) })
@@ -190,6 +192,10 @@ export async function runtimeLocked(counters: SubagentCounters, context: Runtime
       const value = (failure as Error & { code?: unknown; reason?: unknown })[key]
       if (typeof value === 'string') Object.assign(reported, { [key]: value })
     }
+    // The capacity error names the exact byte deficit and the entries that would free it. Without
+    // carrying details through this merge, the model sees "maintenance failed" and no way to act.
+    const details = (capacity as Error & { details?: unknown }).details
+    if (details !== undefined) Object.assign(reported, { details })
     throw reported
   }
 }
@@ -202,9 +208,14 @@ function runtimeError(error: unknown, signal: AbortSignal): Error {
     // JSON serialization drops Error.message but retains the Source's numeric
     // capacity fields. Do not dump arbitrary objects to reconstruct the message.
     const fields = [value?.used, value?.projected, value?.limit]
+    // "one of the entries below" is only true when details carries that list; without it the caller
+    // has to go read the entries itself, so the wording must not promise a list that is not there.
+    const hint = value?.details === undefined
+      ? 'shorten or remove an existing entry, then retry'
+      : 'shorten or remove one of the entries below, or raise the limit'
     fallback = fields.every(field => Number.isSafeInteger(field) && Number(field) >= 0)
-      ? `Runtime memory capacity exceeded: ${value!.projected} bytes (current ${value!.used}, limit ${value!.limit}). Free at least ${Number(value!.projected) - Number(value!.limit)} bytes, then retry: shorten or remove one of the entries below, or raise the limit.`
-      : 'Runtime memory capacity exceeded. Shorten or remove an existing entry, then retry.'
+      ? `Runtime memory capacity exceeded: ${value!.projected} bytes (current ${value!.used}, limit ${value!.limit}). Free at least ${Number(value!.projected) - Number(value!.limit)} bytes, then retry: ${hint}.`
+      : `Runtime memory capacity exceeded. Shorten or remove an existing entry, then retry.`
   }
   const message = errorMessage(error, fallback)
   const result = error instanceof Error && error.message === message ? error : new Error(message, { cause: error })
