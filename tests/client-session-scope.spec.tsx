@@ -1,0 +1,473 @@
+// @vitest-environment jsdom
+import { SlotCore, type StandardSourceBinding } from '@deepseek-ai/dsh-client-ui-slots'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { useRef, type ComponentType } from 'react'
+
+const renderCounts = vi.hoisted(() => ({ workspace: 0, settings: 0 }))
+
+vi.mock('../src/client/MnemonWorkbench.tsx', () => ({
+  MnemonWorkbench: ({ sessionId, workspaceSelection }: { sessionId?: string; workspaceSelection?: { effectiveWorkspaceId?: string } }) => {
+    renderCounts.workspace += 1
+    return <div data-testid="workspace" data-session={sessionId} data-effective-workspace={workspaceSelection?.effectiveWorkspaceId} />
+  },
+}))
+vi.mock('../src/client/MnemonSettingsCard.tsx', () => ({
+  MnemonSettingsCard: ({ sessionId, workspaceId, workspaceLabel }: { sessionId?: string; workspaceId?: string; workspaceLabel?: string }) => {
+    renderCounts.settings += 1
+    return <div data-testid="settings" data-session={sessionId} data-workspace={workspaceId} data-label={workspaceLabel} />
+  },
+}))
+vi.mock('../src/client/better-sidebar.tsx', () => ({ mountBetterSidebarTab: () => () => {} }))
+
+import { apply } from '../src/client/index.ts'
+import { consumeMnemonAnchor, dispatchMnemonAnchor } from '../src/client/anchor.ts'
+import { en, type MnemonTranslate } from '../src/client/locales.ts'
+import { MnemonBuiltinWorkspaceHost, MnemonWorkspaceHost } from '../src/client/workspace-mount.tsx'
+import { installMemoryComposer, MemoryComposer, MemoryComposerToggle, MEMORY_COMPOSER_PREFERENCE, useMemoryComposerInset } from '../src/client/memory-composer.tsx'
+import type { Config } from '../src/host/protocol.ts'
+import { settingsScope } from './helpers/settings-scope.ts'
+
+const disposers: Array<() => void> = []
+afterEach(() => {
+  cleanup()
+  for (const dispose of disposers.splice(0).reverse()) dispose()
+  document.body.replaceChildren()
+  consumeMnemonAnchor('session-a')
+  consumeMnemonAnchor('session-b')
+  vi.restoreAllMocks()
+})
+
+function observable<T>(initial: T) {
+  let value = initial
+  const listeners = new Set<() => void>()
+  const store = {
+    getSnapshot() { expect(this).toBe(store); return value },
+    subscribe(listener: () => void) {
+      expect(this).toBe(store)
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    publish(next: T) { value = next; for (const listener of listeners) listener() },
+    get subscribers() { return listeners.size },
+  }
+  return store
+}
+
+function binding(key: string | undefined): StandardSourceBinding {
+  return { key, hooks: {}, keyedHooks: {}, props: {} }
+}
+
+function fixture() {
+  const current = observable(binding('session-a'))
+  const catalog = observable<{ byId: Record<string, { cwd?: string }>; current?: string }>({
+    byId: { 'session-a': { cwd: '/tmp/workspace-a' }, 'session-b': { cwd: '/tmp/workspace-b' } },
+  })
+  const workspaces = observable({ items: [
+    { workspaceId: 'workspace-a', title: 'Workspace A', path: '/tmp/workspace-a' },
+    { workspaceId: 'workspace-b', title: 'Workspace B', path: '/tmp/workspace-b' },
+  ] })
+  const locale = observable({ active: 'en' as const, locales: [], revision: 0 })
+  const entries: Array<{ options: { name: string; inject?: () => Record<string, unknown> }; component: ComponentType<Record<string, unknown>> }> = []
+  const ctx = {
+    uiSession: { adapter: { current } },
+    sessions: { list: catalog },
+    workspaces: { list: workspaces },
+    // One runtime object, as in DSH: its store methods must keep their receiver.
+    locale: Object.assign(locale, { register: () => () => {}, bind: () => (key: string) => key }),
+    connection: { rpc: { call: vi.fn(async () => ({ ok: true, value: { status: 'ready', value: { displayMode: 'builtin' }, writable: true, mode: 'host' } })) }, isLoopback: true },
+    effect(callback: () => unknown) { const dispose = callback(); if (typeof dispose === 'function') disposers.push(dispose as () => void) },
+    // Plugins page navigation and the DSH settings mirror are not provided here.
+    inject: () => {},
+    layout: { selectPanel: () => {} },
+    slots: {
+      inject(_name: string, factory: () => (() => void)) { const dispose = factory(); disposers.push(dispose); return dispose },
+      entries: () => [],
+      entriesOfSlot: () => [],
+      getVersion: () => 0,
+      subscribe: () => () => {},
+      register(options: unknown, component: unknown) { entries.push({ options, component } as typeof entries[number]); return () => {} },
+    },
+  }
+  const settings = settingsScope<Config>({ status: 'ready', value: {}, writable: true, mode: 'host' })
+  const workspaceProps = {
+    connection: ctx.connection as never,
+    settingsScope: settings,
+    sessions: ctx.sessions as never,
+    workspaces: ctx.workspaces as never,
+    currentSession: current,
+    localeRuntime: locale as never,
+    sourcePageDirectory: { getSnapshot: () => [] as const, subscribe: () => () => {} },
+    t: (key: string) => key,
+  }
+  function renderSettings() {
+    apply(ctx)
+    const entry = entries.find(candidate => candidate.options.name === 'plugins.bundle.config')!
+    // A root slot caches its injected props: session updates must come from
+    // subscriptions inside the mounted component, not another inject call.
+    const props = entry.options.inject!()
+    const Component = entry.component
+    // The Plugins page renders a bundle's configuration as its `page` view.
+    return render(<Component {...props} view="page" />)
+  }
+  return { ctx, current, catalog, workspaces, workspaceProps, renderSettings }
+}
+
+describe('published UI session binding', () => {
+  it('updates Sidebar session scope when the main binding changes with an unchanged catalog', () => {
+    const f = fixture()
+    const catalogSnapshot = f.catalog.getSnapshot()
+    const view = render(<MnemonWorkspaceHost {...f.workspaceProps} />)
+    expect(screen.getByTestId('workspace').dataset.session).toBe('session-a')
+    expect(screen.getByTestId('workspace').dataset.effectiveWorkspace).toBe('workspace-a')
+
+    act(() => f.current.publish(binding('session-b')))
+    expect(f.catalog.getSnapshot()).toBe(catalogSnapshot)
+    expect(screen.getByTestId('workspace').dataset.session).toBe('session-b')
+    expect(screen.getByTestId('workspace').dataset.effectiveWorkspace).toBe('workspace-b')
+    act(() => f.current.publish(binding(undefined)))
+    expect(screen.getByTestId('workspace').dataset.session).toBeUndefined()
+    expect(screen.getByTestId('workspace').dataset.effectiveWorkspace).toBeUndefined()
+
+    view.unmount()
+    expect(f.current.subscribers).toBe(0)
+    expect(f.catalog.subscribers).toBe(0)
+    expect(f.workspaces.subscribers).toBe(0)
+  })
+
+  it('keeps an explicit workspace seat and Builtin owner separate from the main binding', () => {
+    const f = fixture()
+    const view = render(<MnemonWorkspaceHost {...f.workspaceProps} sessionId="session-b" />)
+    expect(screen.getByTestId('workspace').dataset.session).toBe('session-b')
+    act(() => f.current.publish(binding(undefined)))
+    expect(screen.getByTestId('workspace').dataset.session).toBe('session-b')
+    view.unmount()
+
+    render(<MnemonBuiltinWorkspaceHost {...f.workspaceProps} sessionId="session-b" />)
+    act(() => f.current.publish(binding('session-a')))
+    expect(screen.getByTestId('workspace').dataset.session).toBe('session-b')
+  })
+
+  it('acquires the composer only for the mounted Builtin owner and releases it on a tab change', () => {
+    const f = fixture()
+    const composer = new MemoryComposer()
+    composer.setCollapsed(true, false)
+    const active = new Set<string>()
+    composer.connect(id => { active.add(id); return () => { active.delete(id) } })
+    const view = render(<MnemonBuiltinWorkspaceHost {...f.workspaceProps} composer={composer} sessionId="session-b" />)
+    expect([...active]).toEqual(['session-b'])
+    act(() => f.current.publish(binding('session-a')))
+    expect([...active]).toEqual(['session-b'])
+    view.rerender(<MnemonBuiltinWorkspaceHost {...f.workspaceProps} composer={composer} sessionId="session-c" />)
+    expect([...active]).toEqual(['session-c'])
+    view.unmount()
+    expect(active.size).toBe(0)
+  })
+
+  it('does not replace an explicitly absent session scope with the main session', () => {
+    const f = fixture()
+    render(<MnemonWorkspaceHost {...f.workspaceProps} sessionId={undefined} />)
+    expect(screen.getByTestId('workspace').dataset.session).toBeUndefined()
+    act(() => f.current.publish(binding('session-b')))
+    expect(screen.getByTestId('workspace').dataset.session).toBeUndefined()
+  })
+
+  it('updates cached Settings props from the binding, catalog, and workspace sources', () => {
+    const f = fixture()
+    const view = f.renderSettings()
+    expect(screen.getByTestId('settings').dataset).toMatchObject({ session: 'session-a', workspace: 'workspace-a', label: 'Workspace A' })
+    act(() => f.current.publish(binding('session-b')))
+    expect(screen.getByTestId('settings').dataset).toMatchObject({ session: 'session-b', workspace: 'workspace-b', label: 'Workspace B' })
+    act(() => f.workspaces.publish({ items: [{ workspaceId: 'workspace-b', title: 'Renamed B', path: '/tmp/workspace-b' }] }))
+    expect(screen.getByTestId('settings').dataset.label).toBe('Renamed B')
+    view.unmount()
+    expect(f.current.subscribers).toBe(0)
+    expect(f.catalog.subscribers).toBe(0)
+    expect(f.workspaces.subscribers).toBe(0)
+  })
+
+  it('waits for a selected session workspace and never borrows another workspace while its catalog loads', () => {
+    const f = fixture()
+    f.current.publish(binding('session-b'))
+    f.catalog.publish({ byId: { 'session-a': { cwd: '/tmp/workspace-a' } }, current: 'session-a' })
+    f.renderSettings()
+    expect(screen.getByTestId('settings').dataset.session).toBe('session-b')
+    expect(screen.getByTestId('settings').dataset.workspace).toBeUndefined()
+    act(() => f.catalog.publish({ byId: { 'session-b': { cwd: '/tmp/workspace-b' } }, current: 'session-a' }))
+    expect(screen.getByTestId('settings').dataset.workspace).toBe('workspace-b')
+    act(() => f.current.publish(binding(undefined)))
+    expect(screen.getByTestId('settings').dataset.session).toBeUndefined()
+  })
+
+  it('uses the live main binding for Builtin anchor matching and removes the listener on disposal', async () => {
+    const f = fixture()
+    const button = document.createElement('button')
+    button.setAttribute('role', 'tab')
+    button.textContent = 'tab.label'
+    const click = vi.fn()
+    button.addEventListener('click', click)
+    const conversation = document.createElement('div')
+    conversation.dataset.slot = 'main.conversation'
+    conversation.append(button)
+    document.body.append(conversation)
+    apply(f.ctx)
+    await act(async () => {})
+    f.current.publish(binding('session-b'))
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-a' })
+    expect(click).not.toHaveBeenCalled()
+    expect(consumeMnemonAnchor('session-a')).toMatchObject({ page: 'status', sessionId: 'session-a' })
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-b' })
+    expect(click).toHaveBeenCalledTimes(1)
+    for (const dispose of disposers.splice(0).reverse()) dispose()
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-b' })
+    expect(click).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves Builtin anchors pending for ambiguous tabs or an absent main session', async () => {
+    const f = fixture()
+    const first = document.createElement('button')
+    first.setAttribute('role', 'tab')
+    first.textContent = 'tab.label'
+    const second = first.cloneNode(true) as HTMLButtonElement
+    const firstClick = vi.fn()
+    const secondClick = vi.fn()
+    first.addEventListener('click', firstClick)
+    second.addEventListener('click', secondClick)
+    const conversation = document.createElement('div')
+    conversation.dataset.slot = 'main.conversation'
+    conversation.append(first, second)
+    document.body.append(conversation)
+    apply(f.ctx)
+    await act(async () => {})
+
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-a' })
+    expect(firstClick).not.toHaveBeenCalled()
+    expect(secondClick).not.toHaveBeenCalled()
+    expect(consumeMnemonAnchor('session-a')).toMatchObject({ page: 'status' })
+
+    second.remove()
+    f.current.publish(binding(undefined))
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-a' })
+    expect(firstClick).not.toHaveBeenCalled()
+    expect(consumeMnemonAnchor('session-a')).toMatchObject({ page: 'status' })
+
+    f.current.publish(binding('session-a'))
+    first.disabled = true
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-a' })
+    expect(firstClick).not.toHaveBeenCalled()
+    expect(consumeMnemonAnchor('session-a')).toMatchObject({ page: 'status' })
+  })
+
+  it('never opens a foreign label-matching tab outside the main conversation outlet', async () => {
+    const f = fixture()
+    const foreign = document.createElement('button')
+    foreign.setAttribute('role', 'tab')
+    foreign.textContent = 'tab.label'
+    const foreignClick = vi.fn()
+    foreign.addEventListener('click', foreignClick)
+    const conversation = document.createElement('div')
+    conversation.dataset.slot = 'main.conversation'
+    document.body.append(foreign, conversation)
+    apply(f.ctx)
+    await act(async () => {})
+
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-a' })
+    expect(foreignClick).not.toHaveBeenCalled()
+    expect(consumeMnemonAnchor('session-a')).toMatchObject({ page: 'status' })
+
+    const own = foreign.cloneNode(true) as HTMLButtonElement
+    const ownClick = vi.fn()
+    own.addEventListener('click', ownClick)
+    conversation.append(own)
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-a' })
+    expect(foreignClick).not.toHaveBeenCalled()
+    expect(ownClick).toHaveBeenCalledTimes(1)
+
+    const otherConversation = conversation.cloneNode(true)
+    document.body.append(otherConversation)
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-a' })
+    expect(ownClick).toHaveBeenCalledTimes(1)
+    expect(consumeMnemonAnchor('session-a')).toMatchObject({ page: 'status' })
+  })
+
+  it('activates Builtin conversation view directly via uiConversation without rAF DOM tab scraping', async () => {
+    const f = fixture()
+    const selectView = vi.fn()
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame')
+    const ctxWithConversation = {
+      ...f.ctx,
+      uiConversation: { views: { select: selectView } },
+      inject(deps: readonly string[], callback: (scoped: unknown) => void) {
+        if (deps.includes('uiConversation')) callback(ctxWithConversation)
+      },
+    }
+    apply(ctxWithConversation as never)
+    await act(async () => {})
+
+    rafSpy.mockClear()
+    dispatchMnemonAnchor({ page: 'status', sessionId: 'session-a' })
+    expect(selectView).toHaveBeenCalledWith('session-a', 'mnemon')
+    expect(rafSpy).not.toHaveBeenCalled()
+  })
+
+  it('does not re-render MnemonWorkspaceHost or MnemonSettingsHost when streaming session updates keep cwd unchanged', () => {
+    const f = fixture()
+    renderCounts.workspace = 0
+    renderCounts.settings = 0
+    render(<MnemonWorkspaceHost {...f.workspaceProps} />)
+    f.renderSettings()
+    const baselineWorkspace = renderCounts.workspace
+    const baselineSettings = renderCounts.settings
+
+    for (let tick = 1; tick <= 5; tick += 1) {
+      act(() => f.catalog.publish({
+        byId: {
+          'session-a': { cwd: '/tmp/workspace-a', title: `Streaming ${tick}`, updatedAt: tick, unread: tick % 2 === 0 } as { cwd?: string },
+          'session-b': { cwd: '/tmp/workspace-b', title: `Other ${tick}` } as { cwd?: string },
+        },
+        current: 'session-a',
+      }))
+    }
+    expect(renderCounts.workspace).toBe(baselineWorkspace)
+    expect(renderCounts.settings).toBe(baselineSettings)
+
+    act(() => f.catalog.publish({
+      byId: { 'session-a': { cwd: '/tmp/workspace-b' }, 'session-b': { cwd: '/tmp/workspace-b' } },
+      current: 'session-a',
+    }))
+    expect(renderCounts.workspace).toBeGreaterThan(baselineWorkspace)
+    expect(renderCounts.settings).toBeGreaterThan(baselineSettings)
+  })
+})
+
+describe('Memory view composer', () => {
+  const t: MnemonTranslate = key => en[key] ?? key
+  const releases: Array<() => void> = []
+  afterEach(() => {
+    for (const stop of releases.splice(0).reverse()) stop()
+    localStorage.clear()
+    vi.unstubAllGlobals()
+  })
+
+  function composerFixture(declared = true) {
+    const core = new SlotCore()
+    const declare = () => core.register({ name: 'root', children: { 'conversation.composer': { kind: 'chain', scope: 'session' } } } as never, (() => null) as never)
+    let owner = declared ? declare() : undefined
+    const slots = {
+      register: core.register.bind(core), spec: core.spec.bind(core),
+      inject(name: string, factory: () => () => void) {
+        let stop: (() => void) | undefined
+        const sync = () => {
+          if (core.specDynamic(name) !== undefined) stop ??= factory()
+          else { stop?.(); stop = undefined }
+        }
+        const unsubscribe = core.subscribeDeclaration(name, sync)
+        sync()
+        return () => { unsubscribe(); stop?.() }
+      },
+    }
+    const installed = installMemoryComposer({ slots } as never, t)
+    releases.push(() => { installed.dispose(); owner?.() })
+    return { core, ...installed, declare: () => { owner = declare() }, withdraw: () => { owner?.(); owner = undefined } }
+  }
+
+  it('collapses only a mounted Memory session, yields to pending interaction, and restores on leaving', () => {
+    const { core, composer } = composerFixture()
+    expect(core.entries('conversation.composer')).toHaveLength(0)
+    const leave = composer.mount('memory-session')
+    const entry = core.entries('conversation.composer')[0]!
+    const select = entry.select!
+    expect(entry.options.priority).toBe(Number.MAX_SAFE_INTEGER)
+    expect(select({ sessionId: 'memory-session' } as never)).toBe(true)
+    expect(select({ sessionId: 'other-session' } as never)).toBeNull()
+    expect(select({ sessionId: undefined } as never)).toBeNull()
+    for (const kind of ['approval', 'question', 'plan']) {
+      expect(select({ sessionId: 'memory-session', pendingInteraction: { kind } } as never)).toBeNull()
+    }
+    leave()
+    expect(core.entries('conversation.composer')).toHaveLength(0)
+  })
+
+  it('restores editors in split panes, including two views of the same session', async () => {
+    const { core, composer } = composerFixture()
+    releases.push(composer.mount('same-session'))
+    expect(core.entries('conversation.composer')).toHaveLength(1)
+    const pane = document.createElement('div'); pane.dataset.composerSeat = ''
+    const other = pane.cloneNode() as HTMLElement
+    await act(async () => { document.body.append(pane, other) })
+    expect(composer.getSnapshot().available).toBe(false)
+    expect(core.entries('conversation.composer')).toHaveLength(0)
+    await act(async () => { other.remove() })
+    expect(composer.getSnapshot().available).toBe(true)
+    expect(core.entries('conversation.composer')).toHaveLength(1)
+  })
+
+  it('saves explicit expand/collapse choices without touching conversation data', () => {
+    const { core, composer } = composerFixture()
+    const leave = composer.mount('a'); releases.push(leave)
+    render(<MemoryComposerToggle composer={composer} t={t} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Show message input' }))
+    expect(core.entries('conversation.composer')).toHaveLength(0)
+    expect(localStorage.getItem(MEMORY_COMPOSER_PREFERENCE)).toBe('expanded')
+    expect(new MemoryComposer().getSnapshot().collapsed).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse message input' }))
+    expect(core.entries('conversation.composer')).toHaveLength(1)
+    expect(new MemoryComposer().getSnapshot().collapsed).toBe(true)
+  })
+
+  it('reveals the retained editor for Use skill in its own session and follows another window preference', () => {
+    const { core, composer } = composerFixture()
+    releases.push(composer.mount('a'))
+    window.dispatchEvent(new CustomEvent('dsh-mnemon:skill-use', { detail: { sessionId: 'b', name: 'test' } }))
+    expect(core.entries('conversation.composer')).toHaveLength(1)
+    window.dispatchEvent(new CustomEvent('dsh-mnemon:skill-use', { detail: { sessionId: 'a', name: 'test' } }))
+    expect(core.entries('conversation.composer')).toHaveLength(0)
+    window.dispatchEvent(new StorageEvent('storage', { key: MEMORY_COMPOSER_PREFERENCE, newValue: 'collapsed' }))
+    expect(core.entries('conversation.composer')).toHaveLength(1)
+  })
+
+  it('tolerates unavailable browser storage and releases duplicate view leases independently', () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('blocked') })
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('blocked') })
+    const { core, composer } = composerFixture()
+    const first = composer.mount('a'), second = composer.mount('a')
+    first(); first()
+    expect(core.entries('conversation.composer')).toHaveLength(1)
+    expect(() => composer.setCollapsed(false)).not.toThrow()
+    composer.setCollapsed(true)
+    second()
+    expect(core.entries('conversation.composer')).toHaveLength(0)
+  })
+
+  it('waits for the official chain and removes the controls when it is withdrawn', () => {
+    const { core, composer, declare, withdraw } = composerFixture(false)
+    releases.push(composer.mount('a'))
+    render(<MemoryComposerToggle composer={composer} t={t} />)
+    expect(screen.queryByRole('button')).toBeNull()
+    act(declare)
+    expect(screen.getByRole('button', { name: 'Show message input' })).toBeDefined()
+    expect(core.entries('conversation.composer')).toHaveLength(1)
+    act(withdraw)
+    expect(screen.queryByRole('button')).toBeNull()
+    act(declare)
+    expect(core.entries('conversation.composer')).toHaveLength(1)
+  })
+
+  it('reserves the current composer height only in its owning Memory scrollport', () => {
+    let height = 220
+    const callbacks: Array<() => void> = []
+    vi.stubGlobal('ResizeObserver', class { constructor(callback: () => void) { callbacks.push(callback) } observe() {} unobserve() {} disconnect() {} })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) { return { height: this.hasAttribute('data-composer-seat') ? height : 0 } as DOMRect })
+    function Memory() {
+      const ref = useRef<HTMLElement>(null)
+      useMemoryComposerInset(ref, true)
+      return <main ref={ref} data-testid="memory" />
+    }
+    render(<><div data-conversation-scroll><Memory /><div data-composer-seat /></div><div data-conversation-scroll><main data-testid="other" /><div data-composer-seat /></div></>)
+    expect(screen.getByTestId('memory').style.getPropertyValue('--mn-composer-inset')).toBe('236px')
+    expect(screen.getByTestId('other').style.getPropertyValue('--mn-composer-inset')).toBe('')
+    height = 460
+    act(() => callbacks.forEach(callback => callback()))
+    expect(screen.getByTestId('memory').style.getPropertyValue('--mn-composer-inset')).toBe('476px')
+  })
+})
