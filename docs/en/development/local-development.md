@@ -48,6 +48,26 @@ Build order matters: the root package must build before `plugins/*`, because sub
 Building sub-packages first fails with `error TS2307: Cannot find module 'dsh-mnemon/client'` plus a
 run of `TS7006` implicit-any errors that are only symptoms of that first failure.
 
+## Running the tests
+
+Vitest runs from this checkout against the sources, not the deployed build:
+
+```powershell
+$env:PATH="D:\Git\cmd;$env:PATH"   # one Source spec shells out to `git init`
+& $node $pnpm exec vitest run --dir tests
+```
+
+Git has to be on `PATH` for `tests/source.spec.ts`; without it that file fails with
+`spawnSync git ENOENT`, which looks like a code failure and is not. The suite also has a handful of
+failures that predate any local change — browser-storage shims (`client-session-scope.spec.tsx`),
+`SIGTERM`/`git --version` host assumptions (`git-sync.spec.ts`, `review-tools.spec.ts`), and the
+`pack.spec.ts` archive-size assertions. Diff the failing set against `git stash` before attributing
+one to your change.
+
+`tests/composable-memory.spec.ts` holds a real performance fence (15 s for repeated three-Source
+Views). It is the test that notices if a new per-projection cost is added: guarding every entry body
+made that fence fail until the guard memoized its scan.
+
 ## Verifying a change without restarting DSH
 
 The built packages are plain ESM and can be imported directly:
