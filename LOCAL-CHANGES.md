@@ -54,6 +54,9 @@ TypeScript port of the Hermes Agent threat-pattern design.
   hand edit of `memories.json`, an older build, a pack or sync from another machine — is replaced in
   the projection with `[BLOCKED: …]` instead of being replayed as instructions. The stored entry is
   untouched, so the user can still inspect and remove it.
+- `contracts.ts` `runtimePinnedProjection()` gets the same guard. Pinned entries take a separate
+  route into the prompt (a `PINNED RUNTIME MEMORY` prefix built before the body), so guarding only
+  `contextMarkdown()` would leave pinned entries as an unguarded replay path.
 - `RuntimeMemoryCapacityError` now carries `details: RuntimeCapacityField`
   (`used`, `projected`, `limit`, `overBy`, `entries[{content, importance, pinned?, bytes}]`) and its
   message states the exact byte deficit and the two ways to fix it. Both throw sites pass
@@ -85,7 +88,7 @@ Desktop.
 
 ## Upstream merge surface
 
-Only two upstream files are modified: `plugins/dsh-mnemon-source-runtime/src/controller.ts` and
-`src/host/runtime-capacity.ts`, plus two added files. `threat-scan.ts` has no upstream counterpart,
-so it never conflicts. Keep the capacity-error `details` field additive — nothing in the fork
-changes an existing field's meaning.
+Only three upstream files are modified: `plugins/dsh-mnemon-source-runtime/src/controller.ts`,
+`plugins/dsh-mnemon-source-runtime/src/contracts.ts` and `src/host/runtime-capacity.ts`, plus two
+added files. `threat-scan.ts` has no upstream counterpart, so it never conflicts. Keep the
+capacity-error `details` field additive — nothing in the fork changes an existing field's meaning.

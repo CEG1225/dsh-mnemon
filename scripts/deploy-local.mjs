@@ -8,7 +8,12 @@
 //   node scripts/deploy-local.mjs            # deploy to the default profile
 //   node scripts/deploy-local.mjs --profile desktop
 //   node scripts/deploy-local.mjs --dry-run
-import { cpSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+//
+// A build renames its hashed chunks (`runtime-DmL0It3P.js` -> `runtime-DjkNiYzG.js`), and a copy
+// never removes the old name. Stale chunks are moved into `<lib>/.stale-<stamp>/` instead of being
+// left beside the live ones, so a module graph cannot accidentally resolve to a previous build.
+// Nothing is deleted: the quarantine directory can be inspected and cleared by hand.
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -39,8 +44,18 @@ function packages() {
   return found
 }
 
+/** Flat list of names a build produced, so a stale file beside them is detectable. */
+function builtFiles(dir) {
+  return readdirSync(dir, { withFileTypes: true })
+    .filter(entry => entry.isFile())
+    .map(entry => entry.name)
+}
+
+const stamp = new Date().toISOString().replace(/[:.]/gu, '-')
 let copied = 0
 let missing = 0
+let quarantined = 0
+
 for (const pkg of packages()) {
   const from = join(pkg.dir, 'lib')
   const to = join(modulesDir, pkg.name, 'lib')
@@ -54,13 +69,30 @@ for (const pkg of packages()) {
     missing += 1
     continue
   }
-  const files = readdirSync(from).length
-  console.log(`${dryRun ? 'would copy' : 'copy'} ${pkg.name}: ${files} files -> ${to}`)
-  if (!dryRun) cpSync(from, to, { recursive: true, force: true })
+
+  const built = new Set(builtFiles(from))
+  const stale = existsSync(to) ? builtFiles(to).filter(name => !built.has(name)) : []
+  console.log(
+    `${dryRun ? 'would copy' : 'copy'} ${pkg.name}: ${built.size} files -> ${to}` +
+      (stale.length > 0 ? ` (${stale.length} stale: ${stale.join(', ')})` : ''),
+  )
+  if (dryRun) {
+    copied += 1
+    quarantined += stale.length
+    continue
+  }
+
+  if (stale.length > 0) {
+    const quarantine = join(to, `.stale-${stamp}`)
+    mkdirSync(quarantine, { recursive: true })
+    for (const name of stale) renameSync(join(to, name), join(quarantine, name))
+    quarantined += stale.length
+  }
+  cpSync(from, to, { recursive: true, force: true })
   copied += 1
 }
 
-// The installed root package resolves its own version at runtime; keep it in step with the build.
+// The installed root package resolves its own version at runtime; report a drift, do not "fix" it.
 const builtManifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const installedManifest = join(modulesDir, 'dsh-mnemon', 'package.json')
 if (existsSync(installedManifest)) {
@@ -70,5 +102,8 @@ if (existsSync(installedManifest)) {
   }
 }
 
-console.log(`\n${dryRun ? 'dry run: ' : ''}${copied} package(s) deployed, ${missing} skipped.`)
+console.log(
+  `\n${dryRun ? 'dry run: ' : ''}${copied} package(s) deployed, ${missing} skipped` +
+    (quarantined > 0 ? `, ${quarantined} stale file(s) quarantined.` : '.'),
+)
 console.log('Restart DSH Desktop completely for the new build to load.')

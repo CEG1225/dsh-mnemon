@@ -24,6 +24,11 @@ node scripts/deploy-local.mjs --profile <name>
 directories copied out of the registry tarball — not links into this checkout. `file:` dependencies
 behave the same way: pnpm copies them. Nothing watches this directory.
 
+A build renames its hashed chunks (`runtime-DmL0It3P.js` becomes `runtime-DjkNiYzG.js`), and a copy
+does not remove the previous name. `deploy-local.mjs` moves any file in the installed `lib/` that the
+current build did not produce into `lib/.stale-<timestamp>/`, so the module graph cannot resolve to a
+previous build. Nothing is deleted — clear those directories by hand once you are satisfied.
+
 ## Toolchain
 
 Node and pnpm come from the DSH Desktop bundled runtime; there is no global `node` on PATH.
